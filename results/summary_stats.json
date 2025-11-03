@@ -1,0 +1,8 @@
+{
+  "training_last_1000_mean": 9.589,
+  "training_last_1000_std": 9.065653809847362,
+  "learned_policy_mean": 8.88,
+  "learned_policy_std": 9.563764949014587,
+  "random_baseline_mean": 8.76,
+  "random_baseline_std": 7.6001578930966955
+}
