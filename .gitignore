@@ -1,0 +1,13 @@
+# Virtual environments
+venv*/
+__pycache__/
+
+# OS/IDE files
+.DS_Store
+
+# Outputs (large generated content)
+outputs/
+*.pt
+*.npy
+*.gif
+*.mp4
