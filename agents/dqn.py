@@ -1,113 +1,76 @@
-# agents/dqn.py
 from dataclasses import dataclass
 from typing import Tuple
-import random, numpy as np, torch
+import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
+import random
+
+class DQN(nn.Module):
+    """
+    Simple MLP for Q(s, a).
+    Input: state vector [y, vel, pipe_dist] -> R^3
+    Output: Q-values for each discrete action (e.g., 2: [no-flap, flap])
+    """
+    def __init__(self, state_dim: int = 3, action_dim: int = 2,
+                 hidden_sizes: Tuple[int, int, int] = (128, 128, 64)):
+        super().__init__()
+        h1, h2, h3 = hidden_sizes
+        self.fc1 = nn.Linear(state_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, h3)
+        self.out = nn.Linear(h3, action_dim)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return self.out(x)  
+    
 
 @dataclass
-class DQNConfig:
-    obs_dim: int
-    n_actions: int
-    hidden: Tuple[int, int] = (256, 256)
-    gamma: float = 0.99
-    lr: float = 1e-3
+class EpsilonGreedyConfig:
     eps_start: float = 1.0
     eps_end: float = 0.05
-    eps_decay_steps: int = 150_000
-    buffer_size: int = 200_000
-    batch_size: int = 256
-    target_tau: float = 0.005  # soft update rate
-    device: str = "cpu"
-    seed: int = 2025
+    eps_decay_steps: int = 50_000 
 
-class QNet(nn.Module):
-    def __init__(self, input_dim, n_actions, hidden=(256,256)):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden[0]), nn.ReLU(),
-            nn.Linear(hidden[0], hidden[1]), nn.ReLU(),
-            nn.Linear(hidden[1], n_actions),
-        )
-    def forward(self, x): return self.net(x)
-
-class Replay:
-    def __init__(self, cap, obs_dim, seed=0):
-        self.cap = cap
-        self.obs = np.zeros((cap, obs_dim), dtype=np.float32)
-        self.next = np.zeros((cap, obs_dim), dtype=np.float32)
-        self.act = np.zeros((cap,), dtype=np.int64)
-        self.rew = np.zeros((cap,), dtype=np.float32)
-        self.done = np.zeros((cap,), dtype=np.float32)
-        self.idx = 0; self.full = False
-        random.seed(seed); np.random.seed(seed)
-    def add(self, s, a, r, s2, d):
-        i = self.idx
-        self.obs[i] = s; self.act[i] = a; self.rew[i] = r
-        self.next[i] = s2; self.done[i] = float(d)
-        self.idx = (i + 1) % self.cap
-        self.full = self.full or self.idx == 0
-    def size(self): return self.cap if self.full else self.idx
-    def sample(self, bs):
-        n = self.size()
-        idxs = np.random.randint(0, n, size=bs)
-        return (self.obs[idxs], self.act[idxs], self.rew[idxs],
-                self.next[idxs], self.done[idxs])
 
 class DQNAgent:
-    def __init__(self, cfg: DQNConfig):
-        torch.manual_seed(cfg.seed); np.random.seed(cfg.seed); random.seed(cfg.seed)
-        self.cfg = cfg
-        self.q = QNet(cfg.obs_dim, cfg.n_actions, cfg.hidden).to(cfg.device)
-        self.t = QNet(cfg.obs_dim, cfg.n_actions, cfg.hidden).to(cfg.device)
-        self.t.load_state_dict(self.q.state_dict())
-        self.opt = optim.Adam(self.q.parameters(), lr=cfg.lr)
-        self.replay = Replay(cfg.buffer_size, cfg.obs_dim, seed=cfg.seed)
-        self.step = 0
+    """
+    Wraps a DQN with ε-greedy policy.
+    Use .act(state, global_step) to pick an action.
+    """
+    def __init__(self, q_net: DQN, action_dim: int, eps_cfg: EpsilonGreedyConfig):
+        self.q_net = q_net
+        self.action_dim = action_dim
+        self.eps_cfg = eps_cfg
 
-    def epsilon(self):
-        f = min(1.0, self.step / max(1, self.cfg.eps_decay_steps))
-        return float(self.cfg.eps_start + (self.cfg.eps_end - self.cfg.eps_start) * f)
+    def epsilon(self, global_step: int) -> float:
+        frac = max(0.0, 1.0 - (global_step / max(1, self.eps_cfg.eps_decay_steps)))
+        return self.eps_cfg.eps_end + (self.eps_cfg.eps_start - self.eps_cfg.eps_end) * frac
 
     @torch.no_grad()
-    def act(self, s_np):
-        self.step += 1
-        if random.random() < self.epsilon():
-            return random.randrange(self.cfg.n_actions)
-        s = torch.from_numpy(s_np).to(self.cfg.device).unsqueeze(0)  # [1, obs]
-        q = self.q(s)  # [1, nA]
-        return int(q.argmax(dim=1).item())
+    def act(self, state, global_step: int, device: str = "cpu") -> int:
+        """
+        state: list/np.array/torch.Tensor shape (3,)
+        returns action int in [0, action_dim-1]
+        """
+        eps = self.epsilon(global_step)
+        if random.random() < eps:
+            return random.randrange(self.action_dim)
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32, device=device)
+        q = self.q_net(state.unsqueeze(0)) 
+        return int(torch.argmax(q, dim=1).item())
 
-    def push(self, s, a, r, s2, d): self.replay.add(s, a, r, s2, d)
+def hard_update(target: nn.Module, source: nn.Module):
+    """Copy weights from source -> target (in-place)."""
+    target.load_state_dict(source.state_dict())
 
-    def soft_update(self):
-        with torch.no_grad():
-            for p, tp in zip(self.q.parameters(), self.t.parameters()):
-                tp.data.mul_(1.0 - self.cfg.target_tau).add_(self.cfg.target_tau * p.data)
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    def train_step(self):
-        if self.replay.size() < self.cfg.batch_size: return 0.0
-        s, a, r, s2, d = self.replay.sample(self.cfg.batch_size)
-        dev = self.cfg.device
-        s = torch.from_numpy(s).to(dev)
-        a = torch.from_numpy(a).to(dev)
-        r = torch.from_numpy(r).to(dev)
-        s2= torch.from_numpy(s2).to(dev)
-        d = torch.from_numpy(d).to(dev)
-
-        qsa = self.q(s).gather(1, a.view(-1,1)).squeeze(1)
-        with torch.no_grad():
-            # Double DQN selection
-            a2 = self.q(s2).argmax(dim=1, keepdim=True)
-            q_next = self.t(s2).gather(1, a2).squeeze(1)
-            target = r + (1.0 - d) * self.cfg.gamma * q_next
-        loss = torch.nn.functional.smooth_l1_loss(qsa, target)
-
-        self.opt.zero_grad(); loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q.parameters(), 5.0)
-        self.opt.step()
-        self.soft_update()
-        return float(loss.item())
-
-    def save(self, path): torch.save(self.q.state_dict(), path)
-    def load(self, path):  self.q.load_state_dict(torch.load(path, map_location=self.cfg.device))
